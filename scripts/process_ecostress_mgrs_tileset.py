@@ -58,6 +58,10 @@ AFTERNOON_HOURS=list(range(12, 19))
 # These match the grid of LCMS detections
 OUTPUT_CRS="EPSG:5071"
 OUTPUT_RES=300 # m
+OUTPUT_DIRECTORY="data_working/eco_timeseries/"
+
+if not os.path.exists(OUTPUT_DIRECTORY):
+    os.makedirs(OUTPUT_DIRECTORY, exist_ok=True)
 
 # Datasets with objects
 DETECTIONS = gpd.read_parquet("data_working/detections.parquet")
@@ -224,13 +228,36 @@ def get_objects_in_tiles(tile_ids: str, tile_geoms: gpd.GeoDataFrame, objects: g
     object_subset = objects[objects["geometry"].intersects(tile_geom_subset.to_crs(objects.crs).union_all(), align=False)]
     return object_subset
     
+def get_timeseries_at_objects(objects: gpd.GeoDataFrame, da: xr.DataArray) -> xr.Dataset:
+    '''
+    Acquire a time series of all bands in `da` at each geometry in `objects`.
+    '''
+    ts_objects = []
+    for idx, data in objects.geometry.bounds.iterrows():
+        slicer = dict(
+            x=slice(data["minx"], data["maxx"]),
+            # Maxy goes first because of decreasing y coordinate
+            y=slice(data["maxy"], data["miny"])
+        )
+        
+        this_ts = da.sel(**slicer).load().mean(dim=["x", "y"])\
+            .rename("ts").to_dataset()\
+            .assign(tmin=objects["tmin"][idx])\
+            .assign(tmax=objects["tmax"][idx])\
+            .expand_dims(sample=[idx])
+
+        ts_objects.append(this_ts)
+        
+    return xr.combine_by_coords(ts_objects)
 
 if __name__ == "__main__":
+    # Parse arguments
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tileset", type=str, required=True)
     args = parser.parse_args()
     logger.info(f"Received tileset: {args.tileset}")
 
+    # Get disturbance objects in the tileset
     objects = get_objects_in_tiles(
         args.tileset,
         TILES,
@@ -240,5 +267,25 @@ if __name__ == "__main__":
     n_detections = (objects["tmin"] != -1).sum()
     n_nondetections = (objects["tmin"] == -1).sum()
     logger.info(f"Found {n_detections} detections and {n_nondetections} nondetections.")
+    if n_detections + n_nondetections == 0:
+        logger.error("No objects found, exiting.")
+        sys.exit(1)
     
+    # Load the tileset
     da = get_tileset_data_array(args.tileset, TILES)
+    
+    # Compute time series for each object
+    logger.info("Computing time series for each object")
+    ts_dataset = get_timeseries_at_objects(objects, da)
+    
+    # Print proportion NA pixels for each band
+    logger.info("Proportion NA pixels per band across all objects:")
+    prop_nan_by_band = ts_dataset["ts"].isnull().mean(dim=["sample", "band"])
+    for band, prop in zip(prop_nan_by_band.band, prop_nan_by_band.data):
+        logger.info(f"{band}: {prop:.3f}")
+    
+    # Save output
+    out_path = os.path.join(OUTPUT_DIRECTORY, f"timeseries-{args.tileset}.nc")
+    logger.info(f"Saving output to {out_path}")
+    ts_dataset.to_netcdf(out_path)
+    
