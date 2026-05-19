@@ -1,5 +1,5 @@
 import requests
-from obstore.store import S3Store
+from obstore.store import S3Store, S3Config
 import argparse
 import logging
 from pystac_client import Client
@@ -64,10 +64,10 @@ TILES = gpd.read_file("data_working/sentinel2_tiles_world_with_land.geojson")
 
 def _get_lpcloud_s3_obstore() -> S3Store:
     creds = requests.get(LPCLOUD_AWS_ENDPOINT).json()
-    s3_config = dict(
-        aws_access_key_id=creds["accessKeyId"],
-        aws_secret_access_key=creds["secretAccessKey"],
-        aws_session_token=creds["sessionToken"]
+    s3_config = S3Config(
+        access_key_id=creds["accessKeyId"],
+        secret_access_key=creds["secretAccessKey"],
+        session_token=creds["sessionToken"]
     )
     store = S3Store(
         config=s3_config,
@@ -124,28 +124,23 @@ def search_lpcloud_stac(collections: list[str], **kwargs) -> list[dict[str, Any]
         **kwargs
     ).item_collection_as_dict()
     return items["features"]
-    
-def sentinel_tile_to_shapely_geom(tile: str) -> shapely.Geometry:
-    return shapely.geometry.box(
-        *sentinel_tiles.bbox(tile).transform("EPSG:4326")
-    )
 
-def get_tileset_data_array(tileset: str) -> xr.DataArray:
+def get_tileset_data_array(tileset: str, tile_geoms: gpd.GeoDataFrame) -> xr.DataArray:
     # Parse tiles
     tiles = tileset.split("-")
             
     # Convert to geometries
-    tile_bounds = list(map(sentinel_tile_to_shapely_geom, tiles))
+    tile_bounds = tile_geoms[tile_geoms["Name"].isin(tiles)]
     
     # Search for granules
     logger.info("Searching for granules...")
     search_tasks = [
         search_lpcloud_stac(
             ECO_COLLECTIONS, 
-            intersects=shapely.to_geojson(shapely.centroid(tile)),
+            intersects=shapely.to_geojson(centroid),
             datetime=SEARCH_TEMPORAL_RANGE
         )
-        for tile in tile_bounds
+        for centroid in tile_bounds.geometry.centroid
     ]
     search_results = reduce(list.__add__, search_tasks)
     logger.info(f"Found {len(search_results)} granules in search")
@@ -197,24 +192,20 @@ def get_tileset_data_array(tileset: str) -> xr.DataArray:
     parquet_path = os.path.join(tempdir, f"items-{tileset}.parquet")
     stac_geoparquet.to_geodataframe(search_results_sanitized).to_parquet(parquet_path)
     
+    # Determine total boundary of output
+    total_bbox = tile_bounds.geometry.to_crs(OUTPUT_CRS).total_bounds
+    
     # Load data lazily
     if is_jupyter_hub:
         s3_store = _get_lpcloud_s3_obstore()
     else:
         logging.error("Cannot access granules over HTTP, exiting.")
         sys.exit(0)
-    transformer = Transformer.from_crs("EPSG:4326", OUTPUT_CRS, always_xy=True)
-    
-    total_bbox = shapely.transform(
-        shapely.union_all(tile_bounds),
-        transformation=transformer.transform_bounds,
-        interleaved=False
-    )
     
     tile_da = lazycogs.open(
         parquet_path,
         bands=ECO_ASSETS,
-        bbox=shapely.bounds(total_bbox),
+        bbox=total_bbox,
         crs=OUTPUT_CRS,
         resolution=OUTPUT_RES,
         store=s3_store,
@@ -249,4 +240,4 @@ if __name__ == "__main__":
     n_nondetections = (objects["tmin"] == -1).sum()
     logger.info(f"Found {n_detections} detections and {n_nondetections} nondetections.")
     
-    da = get_tileset_data_array(args.tileset)
+    da = get_tileset_data_array(args.tileset, TILES)
