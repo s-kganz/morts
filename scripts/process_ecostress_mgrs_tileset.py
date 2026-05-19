@@ -1,10 +1,10 @@
 import requests
-from obstore.store import S3Store, S3Config
+from obstore.store import S3Store
 import argparse
 import logging
 from pystac_client import Client
 import shapely
-from sentinel_tiles import sentinel_tiles, UTC_to_solar
+from sentinel_tiles import UTC_to_solar
 from functools import reduce
 from copy import deepcopy
 import sys
@@ -14,10 +14,11 @@ import tempfile
 import stac_geoparquet
 import os
 from typing import Any
-from pyproj import Transformer
 import lazycogs
 import xarray as xr
 import geopandas as gpd
+
+
 
 # Set up logging
 logging.basicConfig(
@@ -64,10 +65,10 @@ TILES = gpd.read_file("data_working/sentinel2_tiles_world_with_land.geojson")
 
 def _get_lpcloud_s3_obstore() -> S3Store:
     creds = requests.get(LPCLOUD_AWS_ENDPOINT).json()
-    s3_config = S3Config(
-        access_key_id=creds["accessKeyId"],
-        secret_access_key=creds["secretAccessKey"],
-        session_token=creds["sessionToken"]
+    s3_config = dict(
+        aws_access_key_id=creds["accessKeyId"],
+        aws_secret_access_key=creds["secretAccessKey"],
+        aws_session_token=creds["sessionToken"]
     )
     store = S3Store(
         config=s3_config,
