@@ -17,8 +17,7 @@ from typing import Any
 import lazycogs
 import xarray as xr
 import geopandas as gpd
-
-
+import warnings
 
 # Set up logging
 logging.basicConfig(
@@ -27,6 +26,12 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 logger = logging.getLogger(__name__)
+
+# Ignore warnings
+# Centroid from square tiles in a geographic CRS
+warnings.filterwarnings("ignore", message=".*Geographic CRS.*")
+# Casting warnings when ingesting data
+warnings.filterwarnings("ignore", message=".*invalid value encountered in cast.*")
 
 # Check if we are on JupyterHub
 import os
@@ -47,9 +52,13 @@ ECO_ASSETS = [
     "Ta", "RH", "NDVI", "LST", "cloud", "QC"
 ]
 
+# Data files
+DETECTIONS_PATH = "data_working/detections.parquet"
+TILES_PATH = "data_working/sentinel2_tiles_world_with_land.geojson"
+
 # Search constants
-SEARCH_TEMPORAL_RANGE="2024-01/2025-01"
-# SEARCH_TEMPORAL_RANGE=None
+# SEARCH_TEMPORAL_RANGE="2024-01/2025-01"
+SEARCH_TEMPORAL_RANGE=None
 
 # Filter constants
 AFTERNOON_HOURS=list(range(12, 19))
@@ -59,13 +68,6 @@ AFTERNOON_HOURS=list(range(12, 19))
 OUTPUT_CRS="EPSG:5071"
 OUTPUT_RES=300 # m
 OUTPUT_DIRECTORY="data_working/eco_timeseries/"
-
-if not os.path.exists(OUTPUT_DIRECTORY):
-    os.makedirs(OUTPUT_DIRECTORY, exist_ok=True)
-
-# Datasets with objects
-DETECTIONS = gpd.read_parquet("data_working/detections.parquet")
-TILES = gpd.read_file("data_working/sentinel2_tiles_world_with_land.geojson")
 
 def _get_lpcloud_s3_obstore() -> S3Store:
     creds = requests.get(LPCLOUD_AWS_ENDPOINT).json()
@@ -195,7 +197,7 @@ def get_tileset_data_array(tileset: str, tile_geoms: gpd.GeoDataFrame) -> xr.Dat
     # Save to geoparquet
     tempdir = tempfile.gettempdir()
     parquet_path = os.path.join(tempdir, f"items-{tileset}.parquet")
-    stac_geoparquet.to_geodataframe(search_results_sanitized).to_parquet(parquet_path)
+    stac_geoparquet.to_geodataframe(search_results_sanitized, dtype_backend="pyarrow").to_parquet(parquet_path)
     
     # Determine total boundary of output
     total_bbox = tile_bounds.geometry.to_crs(OUTPUT_CRS).total_bounds
@@ -235,9 +237,11 @@ def get_timeseries_at_objects(objects: gpd.GeoDataFrame, da: xr.DataArray) -> xr
     ts_objects = []
     for idx, data in objects.geometry.bounds.iterrows():
         slicer = dict(
-            x=slice(data["minx"], data["maxx"]),
+            # Slice objects are inclusive so subtract off one cell
+            # on both axes.
+            x=slice(data["minx"], data["maxx"]-OUTPUT_RES),
             # Maxy goes first because of decreasing y coordinate
-            y=slice(data["maxy"], data["miny"])
+            y=slice(data["maxy"], data["miny"]+OUTPUT_RES)
         )
         
         this_ts = da.sel(**slicer).load().mean(dim=["x", "y"])\
@@ -257,11 +261,19 @@ if __name__ == "__main__":
     args = parser.parse_args()
     logger.info(f"Received tileset: {args.tileset}")
 
+    OUTPUT_DIRECTORY="data_working/eco_timeseries/"    
+    if not os.path.exists(OUTPUT_DIRECTORY):
+        os.makedirs(OUTPUT_DIRECTORY, exist_ok=True)
+    
+    # Datasets with objects
+    detections = gpd.read_parquet(DETECTIONS_PATH)
+    tiles = gpd.read_file(TILES_PATH)
+
     # Get disturbance objects in the tileset
     objects = get_objects_in_tiles(
         args.tileset,
-        TILES,
-        DETECTIONS
+        tiles,
+        detections
     )
     
     n_detections = (objects["tmin"] != -1).sum()
@@ -271,18 +283,35 @@ if __name__ == "__main__":
         logger.error("No objects found, exiting.")
         sys.exit(1)
     
-    # Load the tileset
-    da = get_tileset_data_array(args.tileset, TILES)
+    # Load the tileset and remove problematic attrs
+    da = get_tileset_data_array(args.tileset, tiles)
+    del da.attrs["_stac_backend"]
+    del da.attrs["_stac_time_coords"]
+    del da.attrs["zarr_conventions"]
+
+    # Clip to the area of the objects and load
+    xmin, ymin, xmax, ymax = objects.geometry.total_bounds
+    da_clip = da.sel(x=slice(xmin, xmax), y=slice(ymax, ymin))
+
+    logger.info(f"Clipping reduces memory footprint by {100 * (1 - da.nbytes / da_clip.nbytes):.1f}%")
+    logger.info(f"Loading array of {da_clip.nbytes / 1e9} GB")
+    da_clip = da_clip.load()
     
     # Compute time series for each object
     logger.info("Computing time series for each object")
-    ts_dataset = get_timeseries_at_objects(objects, da)
+    ts_dataset = get_timeseries_at_objects(objects, da_clip)
     
     # Print proportion NA pixels for each band
     logger.info("Proportion NA pixels per band across all objects:")
-    prop_nan_by_band = ts_dataset["ts"].isnull().mean(dim=["sample", "band"])
-    for band, prop in zip(prop_nan_by_band.band, prop_nan_by_band.data):
-        logger.info(f"{band}: {prop:.3f}")
+    prop_nan_by_band = ts_dataset["ts"].isnull().mean(dim=["sample", "time"])
+    for band, prop in zip(prop_nan_by_band.band.data, prop_nan_by_band.data):
+        logger.info(f"\t{band}: {prop:.3f}")
+
+    # Check if any objects were fully nan, which would indicate we computed the
+    # boundary wrong.
+    prop_nan_by_sample = ts_dataset["ts"].isnull().mean(dim=["band", "time"])
+    if (prop_nan_by_sample == 1).any():
+        logger.error("Some objects had no valid pixels!")
     
     # Save output
     out_path = os.path.join(OUTPUT_DIRECTORY, f"timeseries-{args.tileset}.nc")

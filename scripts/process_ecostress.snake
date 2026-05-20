@@ -1,0 +1,12 @@
+with open("data_working/tilesets_to_process.txt") as f: 
+    tilesets = list(map(lambda x: x.strip(), f.readlines()))
+
+rule all:
+    input:
+        expand("data_working/eco_timeseries/timeseries-{tileset}.nc", tileset=tilesets[:5])
+
+rule process_tileset:
+    output:
+        "data_working/eco_timeseries/timeseries-{tileset}.nc"
+    shell:
+        "python scripts/process_ecostress_mgrs_tileset.py --tileset {wildcards.tileset}"
