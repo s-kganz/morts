@@ -53,12 +53,13 @@ ECO_ASSETS = [
 ]
 
 # Data files
-DETECTIONS_PATH = "data_working/detections.parquet"
+DETECTIONS_PATH = "data_working/detections_labeled.parquet"
 TILES_PATH = "data_working/sentinel2_tiles_world_with_land.geojson"
+STAC_CACHE_DIR = "data_working/stac_cache/"
 
 # Search constants
-# SEARCH_TEMPORAL_RANGE="2024-01/2025-01"
-SEARCH_TEMPORAL_RANGE=None
+SEARCH_TEMPORAL_RANGE="2024-01/2025-01"
+# SEARCH_TEMPORAL_RANGE=None
 
 # Filter constants
 AFTERNOON_HOURS=list(range(12, 19))
@@ -132,24 +133,41 @@ def search_lpcloud_stac(collections: list[str], **kwargs) -> list[dict[str, Any]
     ).item_collection_as_dict()
     return items["features"]
 
-def get_tileset_data_array(tileset: str, tile_geoms: gpd.GeoDataFrame) -> xr.DataArray:
-    # Parse tiles
-    tiles = tileset.split("-")
-            
+def get_ecostress_tile_parquet(tile_geoms: gpd.GeoDataFrame, tile: str) -> None:
+    '''
+    Checks if a parquet file exists for this tile, and if not,
+    searches for said tile.
+    
+    :param tile: 5-character MGRS tile.
+    :type tile: str
+    '''
+    fname = os.path.join(STAC_CACHE_DIR, f"{tile}.parquet")
+    if os.path.exists(fname):
+        # Cache hit! No need to search
+        return
+
+    # We have not seen this tile before, search for it
+    tile_centroid = tile_geoms[tile_geoms["Name"].isin([tile])].geometry.centroid[0]
+    
+
+def get_ecostress_tile_parquet(tile: str, tile_geoms: gpd.GeoDataFrame) -> None:
+    fname = os.path.join(STAC_CACHE_DIR, f"{tile}.parquet")
+    if os.path.exists(fname):
+        # Cache hit! No need to search
+        logger.info(f"{fname} found in cache directory")
+        return
+    logger.info(f"{fname} not found in cache. Searching...")
+    
     # Convert to geometries
-    tile_bounds = tile_geoms[tile_geoms["Name"].isin(tiles)]
+    tile_center = tile_geoms[tile_geoms["Name"].isin([tile])].geometry.centroid.iloc[0]
     
     # Search for granules
-    logger.info("Searching for granules...")
-    search_tasks = [
-        search_lpcloud_stac(
-            ECO_COLLECTIONS, 
-            intersects=shapely.to_geojson(centroid),
-            datetime=SEARCH_TEMPORAL_RANGE
-        )
-        for centroid in tile_bounds.geometry.centroid
-    ]
-    search_results = reduce(list.__add__, search_tasks)
+    search_results = search_lpcloud_stac(
+        ECO_COLLECTIONS, 
+        intersects=shapely.to_geojson(tile_center),
+        datetime=SEARCH_TEMPORAL_RANGE
+    )
+    
     logger.info(f"Found {len(search_results)} granules in search")
     if len(search_results) == 0:
         logger.error("Found no granules in search, exiting.")
@@ -195,24 +213,20 @@ def get_tileset_data_array(tileset: str, tile_geoms: gpd.GeoDataFrame) -> xr.Dat
     ))
     
     # Save to geoparquet
-    tempdir = tempfile.gettempdir()
-    parquet_path = os.path.join(tempdir, f"items-{tileset}.parquet")
-    stac_geoparquet.to_geodataframe(search_results_sanitized, dtype_backend="pyarrow").to_parquet(parquet_path)
+    stac_geoparquet.to_geodataframe(search_results_sanitized, dtype_backend="numpy_nullable").to_parquet(fname)
     
-    # Determine total boundary of output
-    total_bbox = tile_bounds.geometry.to_crs(OUTPUT_CRS).total_bounds
-    
+def get_tileset_data_array(full_parquet_path: str, bbox: tuple[float, float, float, float]) -> xr.DataArray | None:
     # Load data lazily
     if is_jupyter_hub:
         s3_store = _get_lpcloud_s3_obstore()
     else:
         logging.error("Cannot access granules over HTTP, exiting.")
-        sys.exit(0)
-    
+        return None
+        
     tile_da = lazycogs.open(
-        parquet_path,
+        full_parquet_path,
         bands=ECO_ASSETS,
-        bbox=total_bbox,
+        bbox=bbox,
         crs=OUTPUT_CRS,
         resolution=OUTPUT_RES,
         store=s3_store,
@@ -221,20 +235,11 @@ def get_tileset_data_array(tileset: str, tile_geoms: gpd.GeoDataFrame) -> xr.Dat
     
     return tile_da
     
-def get_objects_in_tiles(tile_ids: str, tile_geoms: gpd.GeoDataFrame, objects: gpd.GeoDataFrame):
-    '''
-    Returns a subset of `objects` that are within the MGRS grids in `tileset`.
-    '''
-    tileset = tile_ids.split("-")
-    tile_geom_subset = tile_geoms[tile_geoms["Name"].isin(tileset)]
-    object_subset = objects[objects["geometry"].intersects(tile_geom_subset.to_crs(objects.crs).union_all(), align=False)]
-    return object_subset
-    
 def get_timeseries_at_objects(objects: gpd.GeoDataFrame, da: xr.DataArray) -> xr.Dataset:
     '''
     Acquire a time series of all bands in `da` at each geometry in `objects`.
     '''
-    ts_objects = []
+    ts_objects: list[xr.Dataset] = []
     for idx, data in objects.geometry.bounds.iterrows():
         slicer = dict(
             # Slice objects are inclusive so subtract off one cell
@@ -244,7 +249,7 @@ def get_timeseries_at_objects(objects: gpd.GeoDataFrame, da: xr.DataArray) -> xr
             y=slice(data["maxy"], data["miny"]+OUTPUT_RES)
         )
         
-        this_ts = da.sel(**slicer).load().mean(dim=["x", "y"])\
+        this_ts = da.sel(**slicer).mean(dim=["x", "y"])\
             .rename("ts").to_dataset()\
             .assign(tmin=objects["tmin"][idx])\
             .assign(tmax=objects["tmax"][idx])\
@@ -257,49 +262,62 @@ def get_timeseries_at_objects(objects: gpd.GeoDataFrame, da: xr.DataArray) -> xr
 if __name__ == "__main__":
     # Parse arguments
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--tileset", type=str, required=True)
+    parser.add_argument("--subtree", type=int, required=True)
     args = parser.parse_args()
-    logger.info(f"Received tileset: {args.tileset}")
+    logger.info(f"Processing subtree {args.subtree}")
 
-    OUTPUT_DIRECTORY="data_working/eco_timeseries/"    
+    # Make sure output directory is available
     if not os.path.exists(OUTPUT_DIRECTORY):
         os.makedirs(OUTPUT_DIRECTORY, exist_ok=True)
     
-    # Datasets with objects
-    detections = gpd.read_parquet(DETECTIONS_PATH)
-    tiles = gpd.read_file(TILES_PATH)
-
-    # Get disturbance objects in the tileset
-    objects = get_objects_in_tiles(
-        args.tileset,
-        tiles,
-        detections
-    )
+    # Load data and subset to the subtree
+    objects = gpd.read_parquet(DETECTIONS_PATH)
+    objects = objects[objects.subtree == args.subtree]
     
+    # Log stats about the number of objects in this subtree
     n_detections = (objects["tmin"] != -1).sum()
     n_nondetections = (objects["tmin"] == -1).sum()
     logger.info(f"Found {n_detections} detections and {n_nondetections} nondetections.")
     if n_detections + n_nondetections == 0:
         logger.error("No objects found, exiting.")
         sys.exit(1)
+        
+    # Figure out what tiles are in this subtree
+    tiles = gpd.read_file(TILES_PATH)
+    tiles = tiles[tiles.geometry.intersects(objects.geometry.to_crs(tiles.crs).union_all())]
+    tileset : list[str] = list(tiles["Name"])
+    if len(tileset) == 0:
+        logger.error("Objects do not intersect any MGRS tiles, exiting.")
+        sys.exit(1)
+    logger.info(f"Intersecting MGRS tiles: {tileset}")
+        
+    # Make sure the search results for each tile are available
+    stac_parquet_objects: list[gpd.GeoDataFrame] = []
+    for tile in tileset:
+        get_ecostress_tile_parquet(tile, tiles)
+        stac_parquet_objects.append(gpd.read_parquet(os.path.join(STAC_CACHE_DIR, f"{tile}.parquet")))
+        
+    # Combine all the tiles into one parquet, and save that to a tempfile
+    # for loading with lazycogs. All of these are STAC items in 4326 so we can concat
+    # without worrying about projection differences.
+    tempdir = tempfile.gettempdir()
+    full_parquet_path = os.path.join(tempdir, f"subtree-{args.subtree}.parquet")
+    pd.concat(stac_parquet_objects).to_parquet(full_parquet_path)
     
     # Load the tileset and remove problematic attrs
-    da = get_tileset_data_array(args.tileset, tiles)
+    da = get_tileset_data_array(full_parquet_path, objects.geometry.total_bounds)
+    
+    if da is None:
+        sys.exit(0)
+    else:
+        da = da.load()
+    
     del da.attrs["_stac_backend"]
     del da.attrs["_stac_time_coords"]
     del da.attrs["zarr_conventions"]
 
-    # Clip to the area of the objects and load
-    xmin, ymin, xmax, ymax = objects.geometry.total_bounds
-    da_clip = da.sel(x=slice(xmin, xmax), y=slice(ymax, ymin))
-
-    logger.info(f"Clipping reduces memory footprint by {100 * (1 - da.nbytes / da_clip.nbytes):.1f}%")
-    logger.info(f"Loading array of {da_clip.nbytes / 1e9} GB")
-    da_clip = da_clip.load()
-    
-    # Compute time series for each object
     logger.info("Computing time series for each object")
-    ts_dataset = get_timeseries_at_objects(objects, da_clip)
+    ts_dataset = get_timeseries_at_objects(objects, da)
     
     # Print proportion NA pixels for each band
     logger.info("Proportion NA pixels per band across all objects:")
