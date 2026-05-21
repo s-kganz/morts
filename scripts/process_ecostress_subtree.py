@@ -26,6 +26,7 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 logger = logging.getLogger(__name__)
+print(__name__)
 
 # Ignore warnings
 # Centroid from square tiles in a geographic CRS
@@ -58,8 +59,8 @@ TILES_PATH = "data_working/sentinel2_tiles_world_with_land.geojson"
 STAC_CACHE_DIR = "data_working/stac_cache/"
 
 # Search constants
-SEARCH_TEMPORAL_RANGE="2024-01/2025-01"
-# SEARCH_TEMPORAL_RANGE=None
+# SEARCH_TEMPORAL_RANGE="2024-01/2025-01"
+SEARCH_TEMPORAL_RANGE=None
 
 # Filter constants
 AFTERNOON_HOURS=list(range(12, 19))
@@ -332,7 +333,7 @@ if __name__ == "__main__":
         logger.error("Some objects had no valid pixels!")
     
     # Save output
-    out_path = os.path.join(OUTPUT_DIRECTORY, f"timeseries-{args.tileset}.nc")
+    out_path = os.path.join(OUTPUT_DIRECTORY, f"timeseries-subtree-{args.subtree}.nc")
     logger.info(f"Saving output to {out_path}")
     ts_dataset.to_netcdf(out_path)
     
