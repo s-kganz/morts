@@ -133,22 +133,6 @@ def search_lpcloud_stac(collections: list[str], **kwargs) -> list[dict[str, Any]
         **kwargs
     ).item_collection_as_dict()
     return items["features"]
-
-def get_ecostress_tile_parquet(tile_geoms: gpd.GeoDataFrame, tile: str) -> None:
-    '''
-    Checks if a parquet file exists for this tile, and if not,
-    searches for said tile.
-    
-    :param tile: 5-character MGRS tile.
-    :type tile: str
-    '''
-    fname = os.path.join(STAC_CACHE_DIR, f"{tile}.parquet")
-    if os.path.exists(fname):
-        # Cache hit! No need to search
-        return
-
-    # We have not seen this tile before, search for it
-    tile_centroid = tile_geoms[tile_geoms["Name"].isin([tile])].geometry.centroid[0]
     
 
 def get_ecostress_tile_parquet(tile: str, tile_geoms: gpd.GeoDataFrame) -> None:
@@ -236,7 +220,7 @@ def get_tileset_data_array(full_parquet_path: str, bbox: tuple[float, float, flo
     
     return tile_da
     
-def get_timeseries_at_objects(objects: gpd.GeoDataFrame, da: xr.DataArray) -> xr.Dataset:
+def get_timeseries_at_objects(objects: gpd.GeoDataFrame, da: xr.Dataset) -> xr.Dataset:
     '''
     Acquire a time series of all bands in `da` at each geometry in `objects`.
     '''
@@ -251,7 +235,6 @@ def get_timeseries_at_objects(objects: gpd.GeoDataFrame, da: xr.DataArray) -> xr
         )
         
         this_ts = da.sel(**slicer).mean(dim=["x", "y"])\
-            .rename("ts").to_dataset()\
             .assign(tmin=objects["tmin"][idx])\
             .assign(tmax=objects["tmax"][idx])\
             .expand_dims(sample=[idx])
@@ -259,6 +242,21 @@ def get_timeseries_at_objects(objects: gpd.GeoDataFrame, da: xr.DataArray) -> xr
         ts_objects.append(this_ts)
         
     return xr.combine_by_coords(ts_objects)
+
+def mask_lst(da: xr.DataArray) -> xr.Dataset:
+    '''
+    Mask LST pixels with degraded quality. Also converts
+    remaining bands to variables in a dataset.
+    
+    :param da: Data array containing a QC and LST band
+    :type da: xr.DataArray
+    :return: Description
+    :rtype: DataArray
+    '''
+    ds = da.to_dataset(dim="band")
+    ds["QC"] = ds["QC"].astype(np.int32)
+    ds["LST"] = ds["LST"].where(ds["QC"] & 0b11 == 0)
+    return ds
 
 if __name__ == "__main__":
     # Parse arguments
@@ -316,9 +314,13 @@ if __name__ == "__main__":
     del da.attrs["_stac_backend"]
     del da.attrs["_stac_time_coords"]
     del da.attrs["zarr_conventions"]
+        
+    logger.info("Masking LST product")
+    ds = mask_lst(da)
+    del da # save memory
 
     logger.info("Computing time series for each object")
-    ts_dataset = get_timeseries_at_objects(objects, da)
+    ts_dataset = get_timeseries_at_objects(objects, ds)
     
     # Print proportion NA pixels for each band
     logger.info("Proportion NA pixels per band across all objects:")
