@@ -68,8 +68,12 @@ AFTERNOON_HOURS=list(range(12, 19))
 # Output constants
 # These match the grid of LCMS detections
 OUTPUT_CRS="EPSG:5071"
-OUTPUT_RES=300 # m
+OUTPUT_RES=70 # m, native ecostress resolution
 OUTPUT_DIRECTORY="data_working/eco_timeseries/"
+
+# Approximate memory footprint per sq km of ecostress data
+# at native resolution
+ECO_MB_PER_SQ_KM = 5
 
 def _get_lpcloud_s3_obstore() -> S3Store:
     creds = requests.get(LPCLOUD_AWS_ENDPOINT).json()
@@ -304,6 +308,8 @@ if __name__ == "__main__":
     pd.concat(stac_parquet_objects).to_parquet(full_parquet_path)
     
     # Load the tileset and remove problematic attrs
+    est_footprint = (shapely.geometry.box(*objects.geometry.total_bounds).area / 1e6) * ECO_MB_PER_SQ_KM
+    logger.info(f"Estimated array size (GB): {est_footprint / 1e3:.2f}")
     da = get_tileset_data_array(full_parquet_path, objects.geometry.total_bounds)
     
     if da is None:
@@ -324,15 +330,15 @@ if __name__ == "__main__":
     
     # Print proportion NA pixels for each band
     logger.info("Proportion NA pixels per band across all objects:")
-    prop_nan_by_band = ts_dataset["ts"].isnull().mean(dim=["sample", "time"])
-    for band, prop in zip(prop_nan_by_band.band.data, prop_nan_by_band.data):
-        logger.info(f"\t{band}: {prop:.3f}")
+    prop_nan_by_band = ts_dataset[ECO_ASSETS].isnull().mean(dim=["sample", "time"])
+    for band in prop_nan_by_band.variables.keys():
+        logger.info(f"\t{band}: {prop_nan_by_band[band].data:.3f}")
 
     # Check if any objects were fully nan, which would indicate we computed the
     # boundary wrong.
-    prop_nan_by_sample = ts_dataset["ts"].isnull().mean(dim=["band", "time"])
+    prop_nan_by_sample = ts_dataset[ECO_ASSETS].isnull().mean(dim=["time"])
     if (prop_nan_by_sample == 1).any():
-        logger.error("Some objects had no valid pixels!")
+        logger.warning("Some objects had no valid pixels!")
     
     # Save output
     out_path = os.path.join(OUTPUT_DIRECTORY, f"timeseries-subtree-{args.subtree}.nc")
