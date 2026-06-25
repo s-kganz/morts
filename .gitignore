@@ -3,3 +3,4 @@ data_working/
 .vscode
 .snakemake/
 __pycache__/
+.s3cfg
