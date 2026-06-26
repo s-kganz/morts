@@ -1,12 +1,8 @@
-import requests
 from obstore.store import S3Store
 import argparse
 import logging
 from pystac_client import Client
 import shapely
-from sentinel_tiles import UTC_to_solar
-from functools import reduce
-from copy import deepcopy
 import sys
 import numpy as np
 import pandas as pd
