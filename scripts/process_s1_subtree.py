@@ -15,6 +15,7 @@ import xarray as xr
 import geopandas as gpd
 import warnings
 import configparser
+import time
 
 # Set up logging
 logging.basicConfig(
@@ -23,8 +24,28 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 logger = logging.getLogger(__name__)
-logging.getLogger("lazycogs").setLevel(logging.DEBUG)
-print(__name__)
+
+# When too many requests hit the CDSE API, we want to immediately stop
+# and force a retry through snakemake. Since those warnings are dispatched
+# through the logger we cannot use the warnings module.
+# See 
+# https://stackoverflow.com/questions/76194992/
+# capturing-a-warning-sent-using-logging-warning-from-a-library-function-python
+lazycogs_logger = logging.getLogger("lazycogs")
+
+def too_many_requests_filter(record):
+    print(record.msg)
+    print(record.levelname)
+    print(module)
+    if (
+        "Too Many Requests" in record.msg and 
+        record.levelname == "WARNING" and 
+        record.module == "lazycogs"
+    ):
+        raise RuntimeError("Hit CDSE request limit")
+    return True  # Pass through
+
+lazycogs_logger.addFilter(too_many_requests_filter)
 
 # Ignore warnings
 # Centroid from square tiles in a geographic CRS
@@ -40,6 +61,10 @@ is_jupyter_hub = "jupyter" in os.environ.get("HOSTNAME", default="")
 CDSE_STAC = "https://stac.dataspace.copernicus.eu/v1/"
 CDSE_S3_ENDPOINT = "https://eodata.dataspace.copernicus.eu"
 CDSE_BUCKET = "eodata"
+# Max. number of requests per minute. Use this to strategically
+# call time.sleep so that we do not get a bunch of nan data back.
+# See https://github.com/developmentseed/lazycogs/issues/80.
+CDSE_S3_RATE_LIMIT = 2000
 
 # S1 collections
 COLLECTIONS=[
@@ -59,14 +84,19 @@ TILES_PATH = "data_working/sentinel2_tiles_world_with_land.geojson"
 STAC_CACHE_DIR = "data_working/stac_cache/"
 
 # Search constants
-SEARCH_TEMPORAL_RANGE="2024"
-# SEARCH_TEMPORAL_RANGE=None
+# SEARCH_TEMPORAL_RANGE="2024"
+SEARCH_TEMPORAL_RANGE=None
 
 # Output constants
-# These match the grid of LCMS detections
+# These match the grid of LCMS detections but use a coarser
+# overview resolution in the S1 COGs
 OUTPUT_CRS="EPSG:5071"
-OUTPUT_RES=300 # m
-OUTPUT_DIRECTORY="data_working/eco_timeseries/"
+OUTPUT_RES=80 # m
+OUTPUT_DIRECTORY="data_working/s1_timeseries/"
+
+# CDSE has quota restrictions for the provider-pays bucket. We have to 
+# slow lazycogs down to stay under.
+MAX_CONCURRENT_READS = 1
 
 def _get_cdse_s3_obstore() -> S3Store:
     config = configparser.ConfigParser()
@@ -150,8 +180,22 @@ def get_tileset_data_array(full_parquet_path: str, bbox: tuple[float, float, flo
         crs=OUTPUT_CRS,
         resolution=OUTPUT_RES,
         store=s3_store,
-        nodata=np.nan
-    ).to_dataset("band")
+        nodata=np.nan,
+        max_concurrent_reads=MAX_CONCURRENT_READS,
+        mosaic_method=lazycogs.MeanMethod
+    )
+
+    plan = tile_da.lazycogs.explain()
+    n_reads = plan.total_cog_reads
+
+    if n_reads > CDSE_S3_RATE_LIMIT:
+        logger.warn("Loading this array may result in too many requests!")
+    
+    sleep_time = 60 * n_reads / CDSE_S3_RATE_LIMIT * 0.9
+    logger.info(f"Need to make {n_reads} requests. Sleeping for {sleep_time:.2f} seconds to reduce request rate")
+    time.sleep(sleep_time)
+
+    tile_da = tile_da.load().to_dataset("band")
     
     return tile_da
     
@@ -229,7 +273,17 @@ if __name__ == "__main__":
     if ds is None:
         sys.exit(0)
     else:
-        ds = ds.load()
+        try:
+            ds = ds.load()
+        except TypeError as e:
+            if "429 Too Many Requests" in str(e):
+                print("Failed to read from too many requests")
+                sys.exit(1)
+            else:
+                raise e
+
+    # Has illegal data type for saving
+    del ds.attrs["zarr_conventions"]
         
     logger.info("Computing time series for each object")
     ts_dataset = get_timeseries_at_objects(objects, ds)
@@ -237,8 +291,8 @@ if __name__ == "__main__":
     # Print proportion NA pixels for each band
     logger.info("Proportion NA pixels per band across all objects:")
     prop_nan_by_band = ts_dataset[ASSETS].isnull().mean(dim=["sample", "time"])
-    for band, prop in zip(prop_nan_by_band.band.data, prop_nan_by_band.data):
-        logger.info(f"\t{band}: {prop:.3f}")
+    for band in ASSETS:
+        logger.info(f"\t{band}: {prop_nan_by_band[band].data:.3f}")
 
     # Check if any objects were fully nan, which would indicate we computed the
     # boundary wrong.
