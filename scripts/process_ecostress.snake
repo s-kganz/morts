@@ -1,13 +1,21 @@
 import geopandas as gpd
-n_subtrees = gpd.read_parquet("data_working/detections_labeled.parquet")["subtree"].max()
-subtrees = list(range(n_subtrees+1))
+subtrees = gpd.read_file(config["input"])["subtree"].unique()
 
 rule all:
     input:
-        expand("data_working/eco_timeseries/timeseries-subtree-{subtree}.nc", subtree=subtrees)
+        expand(os.path.join(config["out_dir"], "timeseries-subtree-{subtree}.nc"), subtree=subtrees)
 
 rule process_tileset:
     output:
-        "data_working/eco_timeseries/timeseries-subtree-{subtree}.nc"
+        os.path.join(config["out_dir"], "timeseries-subtree-{subtree}.nc")
     shell:
-        "python scripts/process_ecostress_subtree.py --subtree {wildcards.subtree}"
+        """
+        python scripts/process_ecostress_subtree.py \
+        --input {config[input]} \
+        --where "subtree == {wildcards.subtree}" \
+        --index {config[index]} \
+        --raster_crs {config[raster_crs]} \
+        --raster_res {config[raster_res]} \
+        --out_dir {config[out_dir]} \
+        --out_name timeseries-subtree-{wildcards.subtree}
+        """

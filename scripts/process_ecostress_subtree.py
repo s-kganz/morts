@@ -19,6 +19,8 @@ import xarray as xr
 import geopandas as gpd
 import warnings
 from glob import iglob
+import rioxarray
+import xvec
 
 # Set up logging
 logging.basicConfig(
@@ -57,7 +59,6 @@ ECO_COLLECTIONS = list(ECO_ASSETS.keys())
 ECO_BANDS = list(reduce(list.__add__, ECO_ASSETS.values())) 
 
 # Data files
-DETECTIONS_PATH = "data_working/detections_labeled.parquet"
 TILES_PATH = "data_working/sentinel2_tiles_world_with_land.geojson"
 STAC_CACHE_DIR = "data_working/stac_cache/"
 
@@ -67,12 +68,6 @@ SEARCH_TEMPORAL_RANGE=None
 
 # Filter constants
 AFTERNOON_HOURS=list(range(12, 19))
-
-# Output constants
-# These match the grid of LCMS detections
-OUTPUT_CRS="EPSG:5071"
-OUTPUT_RES=70 # m, native ecostress resolution
-OUTPUT_DIRECTORY="data_working/eco_timeseries/"
 
 # Approximate memory footprint per km^2-year of ecostress data
 # at native resolution
@@ -205,6 +200,15 @@ def get_ecostress_tile_parquet(tile: str, tile_geoms: gpd.GeoDataFrame) -> None:
     
     if len(granules_by_collection["ECO_L2T_LSTE_002"]) != len(granules_by_collection["ECO_L3T_MET_002"]):
         logger.warning("LST and MET have differing numbers of granules!")
+
+    # Make sure we get a hit on every collection
+    collections_without_assets = [
+        coll for coll, assets in granules_by_collection.items()
+        if len(assets) == 0
+    ]
+    if len(collections_without_assets):
+        logger.error(f"Some collections had no assets: {collections_without_assets}")
+        sys.exit(1)
     
     # Sanitize asset keys for loading
     search_results_sanitized = list(map(
@@ -218,7 +222,7 @@ def get_ecostress_tile_parquet(tile: str, tile_geoms: gpd.GeoDataFrame) -> None:
     for collection, data in stac_gdf.groupby("collection"):
         data.to_parquet(os.path.join(STAC_CACHE_DIR, f"{tile}-{collection}.parquet"))
     
-def get_tileset_data_array(parquet_dir: str, bbox: tuple[float, float, float, float]) -> xr.DataArray | None:
+def get_tileset_data_array(parquet_dir: str, **lazycogs_args) -> xr.DataArray | None:
     '''
     Load ECOSTRESS data from a Sentinel tile in the given bbox. 
     '''
@@ -238,10 +242,8 @@ def get_tileset_data_array(parquet_dir: str, bbox: tuple[float, float, float, fl
             tile_da = lazycogs.open(
                 collection_path,
                 bands=[band],
-                bbox=bbox,
-                crs=OUTPUT_CRS,
-                resolution=OUTPUT_RES,
-                store=s3_store
+                store=s3_store,
+                **lazycogs_args
             ).to_dataset(dim="band")\
                 .compute()\
                 .drop_indexes(["x", "y"])\
@@ -256,24 +258,7 @@ def get_timeseries_at_objects(objects: gpd.GeoDataFrame, da: xr.Dataset) -> xr.D
     '''
     Acquire a time series of all bands in `da` at each geometry in `objects`.
     '''
-    ts_objects: list[xr.Dataset] = []
-    for idx, data in objects.geometry.bounds.iterrows():
-        slicer = dict(
-            # Slice objects are inclusive so subtract off one cell
-            # on both axes.
-            x=slice(data["minx"], data["maxx"]-OUTPUT_RES),
-            # Maxy goes first because of decreasing y coordinate
-            y=slice(data["maxy"], data["miny"]+OUTPUT_RES)
-        )
-        
-        this_ts = da.sel(**slicer).mean(dim=["x", "y"])\
-            .assign(tmin=objects["tmin"][idx])\
-            .assign(tmax=objects["tmax"][idx])\
-            .expand_dims(sample=[idx])
-
-        ts_objects.append(this_ts)
-        
-    return xr.combine_by_coords(ts_objects)
+    return da.xvec.zonal_stats(objects.geometry, x_coords="x", y_coords="y")
 
 def mask_lst(da: xr.DataArray) -> xr.Dataset:
     '''
@@ -292,23 +277,29 @@ def mask_lst(da: xr.DataArray) -> xr.Dataset:
 if __name__ == "__main__":
     # Parse arguments
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--subtree", type=int, required=True)
+    parser.add_argument("--out_dir", type=str, required=True)
+    parser.add_argument("--out_name", type=str, required=True)
+    parser.add_argument("--input", type=str, required=True)
+    parser.add_argument("--where", type=str, required=True)
+    parser.add_argument("--index", type=str, required=True)
+    parser.add_argument("--raster_crs", type=str, default="EPSG:5071")
+    parser.add_argument("--raster_res", type=int, default=70)
     args = parser.parse_args()
-    logger.info(f"Processing subtree {args.subtree}")
+    print(args)
+    logger.info(f"Processing input {args.input} with subset argument {args.where}")
 
     # Make sure output directory is available
-    if not os.path.exists(OUTPUT_DIRECTORY):
-        os.makedirs(OUTPUT_DIRECTORY, exist_ok=True)
+    if not os.path.exists(args.out_dir):
+        os.makedirs(args.out_dir, exist_ok=True)
     
     # Load data and subset to the subtree
-    objects = gpd.read_parquet(DETECTIONS_PATH)
-    objects = objects[objects.subtree == args.subtree]
+    objects = gpd.read_file(args.input).query(args.where).set_index(args.index)
     
     # Log stats about the number of objects in this subtree
-    n_detections = (objects["tmin"] != -1).sum()
-    n_nondetections = (objects["tmin"] == -1).sum()
-    logger.info(f"Found {n_detections} detections and {n_nondetections} nondetections.")
-    if n_detections + n_nondetections == 0:
+    # n_detections = (objects["tmin"] != -1).sum()
+    # n_nondetections = (objects["tmin"] == -1).sum()
+    logger.info(f"Found {objects.shape[0]} objects.")
+    if objects.shape[0] == 0:
         logger.error("No objects found, exiting.")
         sys.exit(1)
         
@@ -326,7 +317,11 @@ if __name__ == "__main__":
     for tile in tileset:
         get_ecostress_tile_parquet(tile, tiles)
         for collection in ECO_COLLECTIONS:
-            stac_parquet_objects.append(gpd.read_parquet(os.path.join(STAC_CACHE_DIR, f"{tile}-{collection}.parquet")))
+            try:
+                stac_parquet_objects.append(gpd.read_parquet(os.path.join(STAC_CACHE_DIR, f"{tile}-{collection}.parquet")))
+            except FileNotFoundError:
+                logger.error(f"No granules found for collection {collection}, exiting.")
+                sys.exit(1)
         
     # Combine all relevant searches into temporary parquet files, separated by
     # collection.
@@ -337,9 +332,16 @@ if __name__ == "__main__":
         data.to_parquet(os.path.join(tempdir.name, f"{collection}.parquet"))
     
     # Load the tileset and remove problematic attrs
-    est_footprint = (shapely.geometry.box(*objects.geometry.total_bounds).area / 1e6) * ECO_MB_PER_SQ_KM
-    logger.info(f"Estimated array size (GB): {est_footprint / 1e3:.2f}")
-    ds = get_tileset_data_array(tempdir.name, objects.geometry.total_bounds)
+    # Buffer the extent of the geometry slightly to make zonal stats more likely to work
+    buffered_footprint = shapely.bounds(objects.geometry.union_all().buffer(args.raster_res))
+    est_data_size = (shapely.geometry.box(*buffered_footprint).area / 1e6) * ECO_MB_PER_SQ_KM
+    logger.info(f"Estimated array size (GB): {est_data_size / 1e3:.2f}")
+    ds = get_tileset_data_array(
+        tempdir.name, 
+        bbox=buffered_footprint,
+        crs=args.raster_crs,
+        resolution=args.raster_res
+    )
     
     if ds is None:
         sys.exit(0)
@@ -349,23 +351,25 @@ if __name__ == "__main__":
     logger.info("Masking LST product")
     ds = mask_lst(ds)
 
+    print(ds)
+
     logger.info("Computing time series for each object")
-    ts_dataset = get_timeseries_at_objects(objects, ds)
+    ts_dataset = get_timeseries_at_objects(objects, ds).set_index(geometry=args.index)
     
     # Print proportion NA pixels for each band
     logger.info("Proportion NA pixels per band across all objects:")
-    prop_nan_by_band = ts_dataset[ECO_BANDS].isnull().mean(dim=["sample", "time"])
+    prop_nan_by_band = ts_dataset[ECO_BANDS].isnull().mean(dim=["geometry", "time"])
     for band in prop_nan_by_band.variables.keys():
         logger.info(f"\t{band}: {prop_nan_by_band[band].data:.3f}")
 
     # Check if any objects were fully nan, which would indicate we computed the
     # boundary wrong.
-    prop_nan_by_sample = ts_dataset[ECO_BANDS].isnull().mean(dim=["time"])
+    prop_nan_by_sample = ts_dataset.to_dataarray().isnull().mean(dim=["geometry", "time"])
     if (prop_nan_by_sample == 1).any():
         logger.warning("Some objects had no valid pixels!")
     
     # Save output
-    out_path = os.path.join(OUTPUT_DIRECTORY, f"timeseries-subtree-{args.subtree}.nc")
+    out_path = os.path.join(args.out_dir, f"{args.out_name}.nc")
     logger.info(f"Saving output to {out_path}")
     ts_dataset.to_netcdf(out_path)
     

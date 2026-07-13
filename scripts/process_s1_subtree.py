@@ -16,6 +16,10 @@ import geopandas as gpd
 import warnings
 import configparser
 import time
+import xvec
+import rioxarray
+
+from store_rate_limit import ObjectStoreRateLimiter, RateLimitedStore
 
 # Set up logging
 logging.basicConfig(
@@ -25,27 +29,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# When too many requests hit the CDSE API, we want to immediately stop
-# and force a retry through snakemake. Since those warnings are dispatched
-# through the logger we cannot use the warnings module.
-# See 
-# https://stackoverflow.com/questions/76194992/
-# capturing-a-warning-sent-using-logging-warning-from-a-library-function-python
 lazycogs_logger = logging.getLogger("lazycogs")
-
-def too_many_requests_filter(record):
-    print(record.msg)
-    print(record.levelname)
-    print(module)
-    if (
-        "Too Many Requests" in record.msg and 
-        record.levelname == "WARNING" and 
-        record.module == "lazycogs"
-    ):
-        raise RuntimeError("Hit CDSE request limit")
-    return True  # Pass through
-
-lazycogs_logger.addFilter(too_many_requests_filter)
 
 # Ignore warnings
 # Centroid from square tiles in a geographic CRS
@@ -66,7 +50,10 @@ CDSE_BUCKET = "eodata"
 # See https://github.com/developmentseed/lazycogs/issues/80.
 CDSE_S3_RATE_LIMIT = 2000
 
-# S1 collections
+# Search constants
+# SEARCH_TEMPORAL_RANGE="2024"
+SEARCH_TEMPORAL_RANGE=None
+
 COLLECTIONS=[
     "sentinel-1-global-mosaics"
 ]
@@ -79,24 +66,8 @@ SAR_QUERY = {
 }
 
 # Data files
-DETECTIONS_PATH = "data_working/detections_labeled.parquet"
 TILES_PATH = "data_working/sentinel2_tiles_world_with_land.geojson"
 STAC_CACHE_DIR = "data_working/stac_cache/"
-
-# Search constants
-# SEARCH_TEMPORAL_RANGE="2024"
-SEARCH_TEMPORAL_RANGE=None
-
-# Output constants
-# These match the grid of LCMS detections but use a coarser
-# overview resolution in the S1 COGs
-OUTPUT_CRS="EPSG:5071"
-OUTPUT_RES=80 # m
-OUTPUT_DIRECTORY="data_working/s1_timeseries/"
-
-# CDSE has quota restrictions for the provider-pays bucket. We have to 
-# slow lazycogs down to stay under.
-MAX_CONCURRENT_READS = 1
 
 def _get_cdse_s3_obstore() -> S3Store:
     config = configparser.ConfigParser()
@@ -104,15 +75,18 @@ def _get_cdse_s3_obstore() -> S3Store:
         config.read("/home/jovyan/.s3cfg")
     else:
         config.read(".s3cfg")
-    
+
     store = S3Store(
         aws_access_key_id=config.get("cdse", "access_key"),
         aws_secret_access_key=config.get("cdse", "secret_key"),
         bucket=CDSE_BUCKET,
         endpoint=CDSE_S3_ENDPOINT
     )
+
+    limiter = ObjectStoreRateLimiter(rate=CDSE_S3_RATE_LIMIT*0.9, per=60, burst=1)
+    limited_store = RateLimitedStore(store, limiter)
     
-    return store
+    return limited_store
 
 def _sanitize_item_datetime(features: list[dict[str, Any]]) -> None:
     '''
@@ -140,7 +114,7 @@ def search_cdse_stac(collections: list[str], **kwargs) -> list[dict[str, Any]]:
     
 
 def get_tile_parquet(tile: str, tile_geoms: gpd.GeoDataFrame) -> None:
-    fname = os.path.join(STAC_CACHE_DIR, f"{tile}.parquet")
+    fname = os.path.join(STAC_CACHE_DIR, f"{tile}-s1-mosaic.parquet")
     if os.path.exists(fname):
         # Cache hit! No need to search
         logger.info(f"{fname} found in cache directory")
@@ -169,20 +143,16 @@ def get_tile_parquet(tile: str, tile_geoms: gpd.GeoDataFrame) -> None:
     # Save to geoparquet
     stac_geoparquet.to_geodataframe(search_results, dtype_backend="numpy_nullable").to_parquet(fname)
     
-def get_tileset_data_array(full_parquet_path: str, bbox: tuple[float, float, float, float]) -> xr.Dataset | None:
+def get_tileset_data_array(full_parquet_path: str, **lazycogs_args) -> xr.Dataset | None:
     # Load data lazily
     s3_store = _get_cdse_s3_obstore()
         
     tile_da = lazycogs.open(
         full_parquet_path,
         bands=ASSETS,
-        bbox=bbox,
-        crs=OUTPUT_CRS,
-        resolution=OUTPUT_RES,
         store=s3_store,
-        nodata=np.nan,
-        max_concurrent_reads=MAX_CONCURRENT_READS,
-        mosaic_method=lazycogs.MeanMethod
+        mosaic_method=lazycogs.MeanMethod,
+        **lazycogs_args
     )
 
     plan = tile_da.lazycogs.explain()
@@ -191,9 +161,9 @@ def get_tileset_data_array(full_parquet_path: str, bbox: tuple[float, float, flo
     if n_reads > CDSE_S3_RATE_LIMIT:
         logger.warn("Loading this array may result in too many requests!")
     
-    sleep_time = 60 * n_reads / CDSE_S3_RATE_LIMIT * 0.9
-    logger.info(f"Need to make {n_reads} requests. Sleeping for {sleep_time:.2f} seconds to reduce request rate")
-    time.sleep(sleep_time)
+    #sleep_time = 60 * n_reads / CDSE_S3_RATE_LIMIT * 0.9
+    #logger.info(f"Need to make {n_reads} requests. Sleeping for {sleep_time:.2f} seconds to reduce request rate")
+    #time.sleep(sleep_time)
 
     tile_da = tile_da.load().to_dataset("band")
     
@@ -203,45 +173,31 @@ def get_timeseries_at_objects(objects: gpd.GeoDataFrame, da: xr.Dataset) -> xr.D
     '''
     Acquire a time series of all bands in `da` at each geometry in `objects`.
     '''
-    ts_objects: list[xr.Dataset] = []
-    for idx, data in objects.geometry.bounds.iterrows():
-        slicer = dict(
-            # Slice objects are inclusive so subtract off one cell
-            # on both axes.
-            x=slice(data["minx"], data["maxx"]-OUTPUT_RES),
-            # Maxy goes first because of decreasing y coordinate
-            y=slice(data["maxy"], data["miny"]+OUTPUT_RES)
-        )
-        
-        this_ts = da.sel(**slicer).mean(dim=["x", "y"])\
-            .assign(tmin=objects["tmin"][idx])\
-            .assign(tmax=objects["tmax"][idx])\
-            .expand_dims(sample=[idx])
-
-        ts_objects.append(this_ts)
-        
-    return xr.combine_by_coords(ts_objects)
+    return da.xvec.zonal_stats(objects.geometry, x_coords="x", y_coords="y")
 
 if __name__ == "__main__":
     # Parse arguments
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--subtree", type=int, required=True)
+    parser.add_argument("--out_dir", type=str, required=True)
+    parser.add_argument("--out_name", type=str, required=True)
+    parser.add_argument("--input", type=str, required=True)
+    parser.add_argument("--where", type=str, required=True)
+    parser.add_argument("--index", type=str, required=True)
+    parser.add_argument("--raster_crs", type=str, default="EPSG:5071")
+    parser.add_argument("--raster_res", type=int, default=70)
     args = parser.parse_args()
-    logger.info(f"Processing subtree {args.subtree}")
+    logger.info(f"Processing input {args.input} with subset argument {args.where}")
 
     # Make sure output directory is available
-    if not os.path.exists(OUTPUT_DIRECTORY):
-        os.makedirs(OUTPUT_DIRECTORY, exist_ok=True)
+    if not os.path.exists(args.out_dir):
+        os.makedirs(args.out_dir, exist_ok=True)
     
     # Load data and subset to the subtree
-    objects = gpd.read_parquet(DETECTIONS_PATH)
-    objects = objects[objects.subtree == args.subtree]
+    objects = gpd.read_file(args.input).query(args.where).set_index(args.index)
     
     # Log stats about the number of objects in this subtree
-    n_detections = (objects["tmin"] != -1).sum()
-    n_nondetections = (objects["tmin"] == -1).sum()
-    logger.info(f"Found {n_detections} detections and {n_nondetections} nondetections.")
-    if n_detections + n_nondetections == 0:
+    logger.info(f"Found {objects.shape[0]} objects.")
+    if objects.shape[0] == 0:
         logger.error("No objects found, exiting.")
         sys.exit(1)
         
@@ -258,17 +214,23 @@ if __name__ == "__main__":
     stac_parquet_objects: list[gpd.GeoDataFrame] = []
     for tile in tileset:
         get_tile_parquet(tile, tiles)
-        stac_parquet_objects.append(gpd.read_parquet(os.path.join(STAC_CACHE_DIR, f"{tile}.parquet")))
+        stac_parquet_objects.append(gpd.read_parquet(os.path.join(STAC_CACHE_DIR, f"{tile}-s1-mosaic.parquet")))
         
     # Combine all the tiles into one parquet, and save that to a tempfile
     # for loading with lazycogs. All of these are STAC items in 4326 so we can concat
     # without worrying about projection differences.
     tempdir = tempfile.gettempdir()
-    full_parquet_path = os.path.join(tempdir, f"subtree-{args.subtree}.parquet")
+    full_parquet_path = os.path.join(tempdir, f"stac-subset-{os.getpid()}.parquet")
     pd.concat(stac_parquet_objects).to_parquet(full_parquet_path)
     
-    # Load the tileset and remove problematic attrs
-    ds = get_tileset_data_array(full_parquet_path, objects.geometry.total_bounds)
+    # Load the tileset. Small geometries can be problematic for xvec so buffer a little bit
+    buffered_footprint = shapely.bounds(objects.geometry.union_all().buffer(args.raster_res))
+    ds = get_tileset_data_array(
+        full_parquet_path, 
+        bbox=buffered_footprint,
+        crs=args.raster_crs,
+        resolution=args.raster_res
+    )
     
     if ds is None:
         sys.exit(0)
@@ -286,22 +248,16 @@ if __name__ == "__main__":
     del ds.attrs["zarr_conventions"]
         
     logger.info("Computing time series for each object")
-    ts_dataset = get_timeseries_at_objects(objects, ds)
+    ts_dataset = get_timeseries_at_objects(objects, ds).set_index(geometry=args.index)
     
     # Print proportion NA pixels for each band
     logger.info("Proportion NA pixels per band across all objects:")
-    prop_nan_by_band = ts_dataset[ASSETS].isnull().mean(dim=["sample", "time"])
+    prop_nan_by_band = ts_dataset[ASSETS].isnull().mean(dim=["geometry", "time"])
     for band in ASSETS:
         logger.info(f"\t{band}: {prop_nan_by_band[band].data:.3f}")
-
-    # Check if any objects were fully nan, which would indicate we computed the
-    # boundary wrong.
-    # prop_nan_by_sample = ts_dataset["].isnull().mean(dim=["time"])
-    # if (prop_nan_by_sample == 1).any():
-    #    logger.error("Some objects had no valid pixels!")
     
     # Save output
-    out_path = os.path.join(OUTPUT_DIRECTORY, f"timeseries-subtree-{args.subtree}.nc")
+    out_path = os.path.join(args.out_dir, f"{args.out_name}.nc")
     logger.info(f"Saving output to {out_path}")
     ts_dataset.to_netcdf(out_path)
     
