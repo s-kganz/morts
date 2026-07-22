@@ -1,0 +1,22 @@
+import geopandas as gpd
+subtrees = gpd.read_file(config["input"])["subtree"].unique()
+
+rule all:
+    input:
+        expand(os.path.join(config["out_dir"], "timeseries-subtree-{subtree}.nc"), subtree=subtrees)
+
+rule process_tileset:
+    output:
+        os.path.join(config["out_dir"], "timeseries-subtree-{subtree}.nc")
+    shell:
+        """
+        python scripts/process_clms_ndvi_subtree.py \
+        --input {config[input]} \
+        --where "subtree == {wildcards.subtree}" \
+        --index {config[index]} \
+        --raster_crs {config[raster_crs]} \
+        --raster_res {config[raster_res]} \
+        --out_dir {config[out_dir]} \
+        --out_name timeseries-subtree-{wildcards.subtree}
+        """
+
